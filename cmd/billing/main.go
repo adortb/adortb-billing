@@ -9,6 +9,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/adortb/adortb-common/tenant"
+	"github.com/adortb/adortb-common/vault"
+
 	"github.com/adortb/adortb-billing/internal/advertiser_billing"
 	"github.com/adortb/adortb-billing/internal/api"
 	"github.com/adortb/adortb-billing/internal/consumer"
@@ -34,12 +37,30 @@ func main() {
 		slog.Info("tracing initialized", "otlp_endpoint", otlpEndpoint)
 	}
 
+	// ── Vault ────────────────────────────────────────────────
+	vaultCli, err := vault.New(vault.Config{
+		Addr:  getenv("VAULT_ADDR", ""),
+		Token: getenv("VAULT_TOKEN", ""),
+	})
+	if err != nil {
+		slog.Error("vault init failed", "err", err)
+		os.Exit(1)
+	}
+	dbPassword, _ := vaultCli.GetString("secret/data/adortb/postgres", "password")
+	if dbPassword == "" {
+		dbPassword = getenv("PG_PASSWORD", "adortb_dev")
+	}
+	redisPassword, _ := vaultCli.GetString("secret/data/adortb/redis", "password")
+	if redisPassword == "" {
+		redisPassword = getenv("REDIS_PASSWORD", "")
+	}
+
 	// ── 数据库 ──────────────────────────────────────────────
 	db, err := repo.NewDB(repo.Config{
 		Host:     getenv("PG_HOST", "localhost"),
 		Port:     5432,
 		User:     getenv("PG_USER", "adortb"),
-		Password: getenv("PG_PASSWORD", "adortb_dev"),
+		Password: dbPassword,
 		DBName:   getenv("PG_DBNAME", "adortb"),
 	})
 	if err != nil {
@@ -51,7 +72,7 @@ func main() {
 	// ── Redis ────────────────────────────────────────────────
 	rdb := goredis.NewClient(&goredis.Options{
 		Addr:     getenv("REDIS_ADDR", "localhost:6379"),
-		Password: getenv("REDIS_PASSWORD", ""),
+		Password: redisPassword,
 		DB:       0,
 	})
 	defer rdb.Close()
@@ -78,7 +99,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         ":8085",
-		Handler:      mux,
+		Handler:      tenant.HTTPMiddleware(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
