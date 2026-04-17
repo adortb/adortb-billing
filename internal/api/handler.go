@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/adortb/adortb-billing/internal/advertiser_billing"
+	"github.com/adortb/adortb-billing/internal/pacing"
 	"github.com/adortb/adortb-billing/internal/platform"
 	"github.com/adortb/adortb-billing/internal/publisher_billing"
 	"github.com/adortb/adortb-billing/internal/repo"
@@ -16,9 +17,10 @@ import (
 
 // Handler HTTP handler 聚合
 type Handler struct {
-	advSvc  *advertiser_billing.Service
-	pubSvc  *publisher_billing.Service
-	platSvc *platform.Service
+	advSvc        *advertiser_billing.Service
+	pubSvc        *publisher_billing.Service
+	platSvc       *platform.Service
+	pacingTracker *pacing.Tracker
 }
 
 func NewHandler(
@@ -26,7 +28,12 @@ func NewHandler(
 	pubSvc *publisher_billing.Service,
 	platSvc *platform.Service,
 ) *Handler {
-	return &Handler{advSvc: advSvc, pubSvc: pubSvc, platSvc: platSvc}
+	return &Handler{
+		advSvc:        advSvc,
+		pubSvc:        pubSvc,
+		platSvc:       platSvc,
+		pacingTracker: pacing.NewTracker(nil),
+	}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -34,6 +41,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/publisher/", h.routePublisher)
 	mux.HandleFunc("/v1/admin/withdraw/", h.routeAdminWithdraw)
 	mux.HandleFunc("/v1/platform/daily", h.getPlatformDaily)
+	mux.HandleFunc("/v1/pacing/recalc", h.recalcPacing)
+	mux.HandleFunc("/v1/pacing/", h.getPacing)
 	mux.HandleFunc("/health", h.health)
 }
 
@@ -259,6 +268,73 @@ func (h *Handler) getPlatformDaily(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ── Pacing ────────────────────────────────────────────────────────────────
+
+// getPacing 处理 GET /v1/pacing/{campaign_id}，返回当前 pacing factor。
+// DSP 可定期拉取此接口，据此调整出价或 QPS。
+func (h *Handler) getPacing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	idStr := strings.TrimPrefix(r.URL.Path, "/v1/pacing/")
+	if idStr == "" || idStr == "recalc" {
+		writeError(w, http.StatusBadRequest, "missing campaign_id")
+		return
+	}
+	campaignID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid campaign_id")
+		return
+	}
+
+	factor := h.pacingTracker.Factor(campaignID)
+	st, _ := h.pacingTracker.State(campaignID)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"campaign_id":   campaignID,
+		"pacing_factor": factor,
+		"daily_budget":  st.DailyBudget,
+		"current_spent": st.Spent,
+	})
+}
+
+// recalcPacing 处理 POST /v1/pacing/recalc，触发 pacing 状态重算。
+// 请求体可指定 campaign_id + daily_budget + current_spent 进行更新。
+func (h *Handler) recalcPacing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		CampaignID  int64   `json:"campaign_id"`
+		DailyBudget float64 `json:"daily_budget"`
+		Spent       float64 `json:"current_spent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.CampaignID <= 0 {
+		writeError(w, http.StatusBadRequest, "campaign_id must be positive")
+		return
+	}
+	if req.DailyBudget < 0 {
+		writeError(w, http.StatusBadRequest, "daily_budget must be >= 0")
+		return
+	}
+
+	h.pacingTracker.SetBudget(req.CampaignID, req.DailyBudget)
+	h.pacingTracker.SetSpent(req.CampaignID, req.Spent)
+	h.pacingTracker.Recalc()
+
+	factor := h.pacingTracker.Factor(req.CampaignID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"campaign_id":   req.CampaignID,
+		"pacing_factor": factor,
+	})
 }
 
 // ── helpers ───────────────────────────────────────────────────────
