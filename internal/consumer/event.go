@@ -7,12 +7,45 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/IBM/sarama"
 	"github.com/adortb/adortb-billing/internal/advertiser_billing"
 	"github.com/adortb/adortb-billing/internal/metrics"
 	"github.com/adortb/adortb-billing/internal/platform"
 	"github.com/adortb/adortb-billing/internal/publisher_billing"
 )
+
+// billingKafkaCarrier 实现 propagation.TextMapCarrier，用于从 Kafka 消息头提取 trace context。
+// sarama v1.47 中 msg.Headers 为 []*sarama.RecordHeader。
+type billingKafkaCarrier []*sarama.RecordHeader
+
+func (c billingKafkaCarrier) Get(key string) string {
+	for _, h := range c {
+		if h != nil && string(h.Key) == key {
+			return string(h.Value)
+		}
+	}
+	return ""
+}
+
+func (c *billingKafkaCarrier) Set(key, value string) {
+	h := &sarama.RecordHeader{Key: []byte(key), Value: []byte(value)}
+	*c = append(*c, h)
+}
+
+func (c billingKafkaCarrier) Keys() []string {
+	keys := make([]string, 0, len(c))
+	for _, h := range c {
+		if h != nil {
+			keys = append(keys, string(h.Key))
+		}
+	}
+	return keys
+}
 
 const (
 	topicEvents = "adortb.events"
@@ -106,10 +139,32 @@ func (h *consumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, cl
 }
 
 func (c *Consumer) processMessage(ctx context.Context, msg *sarama.ConsumerMessage) error {
+	// 从 Kafka 消息头提取上游 trace context（由 event 服务注入）
+	carrier := billingKafkaCarrier(msg.Headers) // msg.Headers is []*sarama.RecordHeader
+	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.TextMapCarrier(&carrier))
+
+	tracer := otel.Tracer("adortb-billing")
+	ctx, span := tracer.Start(ctx, "consumer.process",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination", topicEvents),
+			attribute.Int64("messaging.offset", msg.Offset),
+		),
+	)
+	defer span.End()
+
 	var evt AdEvent
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("unmarshal event: %w", err)
 	}
+
+	span.SetAttributes(
+		attribute.String("event.type", evt.Type),
+		attribute.String("event.slot_id", evt.SlotID),
+		attribute.Int64("event.advertiser_id", evt.AdvertiserID),
+	)
 
 	c.metrics.RecordKafkaEvent(evt.Type)
 

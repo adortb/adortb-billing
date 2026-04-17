@@ -16,12 +16,23 @@ import (
 	"github.com/adortb/adortb-billing/internal/platform"
 	"github.com/adortb/adortb-billing/internal/publisher_billing"
 	"github.com/adortb/adortb-billing/internal/repo"
+	"github.com/adortb/adortb-billing/internal/tracing"
 	"github.com/prometheus/client_golang/prometheus"
 	goredis "github.com/redis/go-redis/v9"
 )
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	// ── OpenTelemetry tracing ──────────────────────────────
+	otlpEndpoint := getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4318")
+	tracingShutdown, err := tracing.Init(context.Background(), "adortb-billing", otlpEndpoint)
+	if err != nil {
+		slog.Warn("tracing init failed", "err", err)
+	} else {
+		defer func() { _ = tracingShutdown(context.Background()) }()
+		slog.Info("tracing initialized", "otlp_endpoint", otlpEndpoint)
+	}
 
 	// ── 数据库 ──────────────────────────────────────────────
 	db, err := repo.NewDB(repo.Config{
